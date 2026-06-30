@@ -790,12 +790,18 @@ function seedState() {
   };
 }
 
+// Hardcoded fallback so every device/browser auto-connects to the team's
+// shared Google Sheet backend, even before localStorage has ever been set
+// on that device. Still overridable from Settings if the URL ever changes.
+const DEFAULT_GS_URL = 'https://script.google.com/macros/s/AKfycbx7YQIntzCCTKEwqKIK31WXMyE-dDDj9v47g_k3gbtLIa6I8uwVV-BY-4nsDvDqfZW7uw/exec';
+
 function loadState() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
     if (raw) { const saved=JSON.parse(raw); state = { ...seedState(), ...saved, vehicleClassRates:{...seedState().vehicleClassRates,...(saved.vehicleClassRates||{})}, auth:{userId:null} }; }
     else { state = seedState(); }
   } catch(e) { state = seedState(); }
+  if (!state.gsUrl) { state.gsUrl = DEFAULT_GS_URL; saveState(); }
 }
 function saveState() {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch(e){}
@@ -1306,8 +1312,9 @@ function gsSave() {
   if(!url){toast('Enter a URL','error');return;}
   state.gsUrl=url; saveState();
   closeModal('modal-gs');
-  toast('Google Sheets connected ✓');
+  toast('Google Sheets connected ✓ — pulling existing data…');
   updateSyncBadge();
+  syncFromSheetOnLoad();
 }
 
 // ──────────────────────────────────────────────────────
@@ -1544,7 +1551,7 @@ function renderBilling() {
 
 function updateBilling(track, cat, val) { state.billing.minHours[track][cat]=Number(val); }
 function updateBillingRate(track, type, val) { state.billing.rates[track][type]=Number(val); }
-function saveBilling() { saveState(); toast('Billing config saved ✓'); }
+function saveBilling() { saveState(); pushConfigToSheet(); toast('Billing config saved ✓ (synced to team sheet)'); }
 
 // ──────────────────────────────────────────────────────
 // VEHICLES PAGE
@@ -1644,6 +1651,11 @@ function doPost(e) {
       const sheet = ss.getSheetByName(data.sheetName) || ss.insertSheet(data.sheetName);
       sheet.appendRow(data.row);
     }
+    if (data.action === 'saveConfig') {
+      const sheet = ss.getSheetByName('Config') || ss.insertSheet('Config');
+      sheet.getRange('A1').setValue(JSON.stringify(data.config));
+      sheet.getRange('B1').setValue(new Date());
+    }
     return ContentService.createTextOutput(JSON.stringify({ok:true})).setMimeType(ContentService.MimeType.JSON);
   } catch(err) {
     return ContentService.createTextOutput(JSON.stringify({ok:false,error:err.toString()})).setMimeType(ContentService.MimeType.JSON);
@@ -1653,14 +1665,135 @@ function doGet(e) {
   if (e.parameter.action === 'ping') {
     return ContentService.createTextOutput(JSON.stringify({ok:true,ping:'pong'})).setMimeType(ContentService.MimeType.JSON);
   }
+  if (e.parameter.action === 'getLogs') {
+    const sheetName = e.parameter.sheetName || 'Logs';
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return ContentService.createTextOutput(JSON.stringify({ok:true,rows:[]})).setMimeType(ContentService.MimeType.JSON);
+    const values = sheet.getDataRange().getValues();
+    const rows = values.slice(1).filter(r => r.some(c => c !== '' && c !== null));
+    return ContentService.createTextOutput(JSON.stringify({ok:true,rows:rows})).setMimeType(ContentService.MimeType.JSON);
+  }
+  if (e.parameter.action === 'getConfig') {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName('Config');
+    if (!sheet) return ContentService.createTextOutput(JSON.stringify({ok:true,config:null})).setMimeType(ContentService.MimeType.JSON);
+    const raw = sheet.getRange('A1').getValue();
+    return ContentService.createTextOutput(JSON.stringify({ok:true,config:raw?JSON.parse(raw):null})).setMimeType(ContentService.MimeType.JSON);
+  }
   return ContentService.createTextOutput('NATRAX Logger API');
 }
 */
 
 // ──────────────────────────────────────────────────────
+// PULL FROM SHEET (shared backend → local state)
+// ──────────────────────────────────────────────────────
+// Runs on every load so a brand-new device/browser session recovers
+// existing logs and the team's shared billing config from the Google
+// Sheet, instead of starting from blank defaults. Silently no-ops if
+// offline or unreachable — local state (and localStorage) still works.
+function parseSheetDateTime(dateStr, timeStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  if (timeStr) {
+    const [h, m] = String(timeStr).split(':').map(Number);
+    if (!isNaN(h)) d.setHours(h, isNaN(m) ? 0 : m, 0, 0);
+  }
+  return d.getTime();
+}
+
+function rowToLog(row) {
+  // Column order matches syncLogToSheets(): id, sessionId, date, engineer,
+  // track, trNumber, project, make, model, class, category, rfid, reg,
+  // timeIn, timeOut, actualHrs, billedHrs, odoStart, odoEnd, trackCost,
+  // vehicleCost, totalCost, status
+  const [id, sessionId, date, engineerName, track, trNumber, project,
+    vehicleMake, vehicleModel, vehicleClass, vehicleCategory, rfid, vehicleReg,
+    timeIn, timeOut, actualHours, billedHours, odoStart, odoEnd,
+    trackCost, vehicleCost, totalCost, status] = row;
+  if (!id) return null;
+  const entryAt = parseSheetDateTime(date, timeIn);
+  const exitAt = timeOut ? parseSheetDateTime(date, timeOut) : null;
+  return {
+    id: String(id), sessionId: String(sessionId || ''),
+    engineerName: String(engineerName || ''), track: String(track || ''),
+    meta: {
+      trNumber: trNumber || '', project: project || '',
+      vehicleMake: vehicleMake || '', vehicleModel: vehicleModel || '',
+      vehicleClass: vehicleClass || '', vehicleCategory: vehicleCategory || '',
+      rfid: rfid || '', vehicleReg: vehicleReg || '', odoStart: odoStart || '',
+    },
+    entryAt: entryAt || Date.now(), exitAt: exitAt || null,
+    odoEnd: odoEnd || '',
+    actualHours: Number(actualHours) || 0, billedHours: Number(billedHours) || 0,
+    trackCost: Number(trackCost) || 0, vehicleCost: Number(vehicleCost) || 0,
+    totalCost: Number(totalCost) || 0,
+    status: String(status || 'closed'), sync: 'synced',
+  };
+}
+
+async function pullLogsFromSheet() {
+  if (!state.gsUrl) return;
+  try {
+    const res = await fetch(`${state.gsUrl}?action=getLogs&sheetName=Logs`);
+    const data = await res.json();
+    if (!data || !data.ok || !Array.isArray(data.rows)) return;
+    const remoteLogs = data.rows.map(rowToLog).filter(Boolean);
+    const localById = new Map(state.logs.map(l => [l.id, l]));
+    // Sheet rows are the source of truth for anything already synced;
+    // keep local-only pending entries (not yet pushed) untouched.
+    remoteLogs.forEach(r => localById.set(r.id, { ...localById.get(r.id), ...r }));
+    state.logs = Array.from(localById.values());
+    saveState();
+  } catch (e) { console.warn('Pull logs error', e); }
+}
+
+async function pullConfigFromSheet() {
+  if (!state.gsUrl) return;
+  try {
+    const res = await fetch(`${state.gsUrl}?action=getConfig`);
+    const data = await res.json();
+    if (!data || !data.ok || !data.config) return;
+    const cfg = data.config;
+    if (cfg.minHours) state.billing.minHours = cfg.minHours;
+    if (cfg.rates) state.billing.rates = cfg.rates;
+    if (cfg.vehicleClassRates) state.vehicleClassRates = cfg.vehicleClassRates;
+    saveState();
+  } catch (e) { console.warn('Pull config error', e); }
+}
+
+async function pushConfigToSheet() {
+  if (!state.gsUrl) return;
+  try {
+    await fetch(state.gsUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'saveConfig',
+        config: {
+          minHours: state.billing.minHours,
+          rates: state.billing.rates,
+          vehicleClassRates: state.vehicleClassRates,
+        },
+      }),
+      mode: 'no-cors',
+    });
+  } catch (e) { console.warn('Push config error', e); }
+}
+
+async function syncFromSheetOnLoad() {
+  await Promise.all([pullConfigFromSheet(), pullLogsFromSheet()]);
+  if (typeof currentPage !== 'undefined' && currentPage) {
+    renderPageContent(currentPage);
+  }
+}
+
+// ──────────────────────────────────────────────────────
 // INIT
 // ──────────────────────────────────────────────────────
 loadState();
+syncFromSheetOnLoad();
 
 // Restore GS URL to modal if set
 document.getElementById('gs-url').value = state.gsUrl || '';
@@ -1684,6 +1817,11 @@ function doPost(e) {
       const sheet = ss.getSheetByName(data.sheetName) || ss.insertSheet(data.sheetName);
       sheet.appendRow(data.row);
     }
+    if (data.action === 'saveConfig') {
+      const sheet = ss.getSheetByName('Config') || ss.insertSheet('Config');
+      sheet.getRange('A1').setValue(JSON.stringify(data.config));
+      sheet.getRange('B1').setValue(new Date());
+    }
     return ContentService
       .createTextOutput(JSON.stringify({ok: true}))
       .setMimeType(ContentService.MimeType.JSON);
@@ -1700,6 +1838,35 @@ function doGet(e) {
       .createTextOutput(JSON.stringify({ok: true, ping: 'pong'}))
       .setMimeType(ContentService.MimeType.JSON);
   }
+  if (e.parameter.action === 'getLogs') {
+    try {
+      const sheetName = e.parameter.sheetName || 'Logs';
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sheet = ss.getSheetByName(sheetName);
+      if (!sheet) {
+        return ContentService.createTextOutput(JSON.stringify({ok: true, rows: []})).setMimeType(ContentService.MimeType.JSON);
+      }
+      const values = sheet.getDataRange().getValues();
+      const rows = values.slice(1).filter(r => r.some(c => c !== '' && c !== null));
+      return ContentService.createTextOutput(JSON.stringify({ok: true, rows: rows})).setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      return ContentService.createTextOutput(JSON.stringify({ok: false, error: err.toString()})).setMimeType(ContentService.MimeType.JSON);
+    }
+  }
+  if (e.parameter.action === 'getConfig') {
+    try {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sheet = ss.getSheetByName('Config');
+      if (!sheet) {
+        return ContentService.createTextOutput(JSON.stringify({ok: true, config: null})).setMimeType(ContentService.MimeType.JSON);
+      }
+      const raw = sheet.getRange('A1').getValue();
+      const config = raw ? JSON.parse(raw) : null;
+      return ContentService.createTextOutput(JSON.stringify({ok: true, config: config})).setMimeType(ContentService.MimeType.JSON);
+    } catch (err) {
+      return ContentService.createTextOutput(JSON.stringify({ok: false, error: err.toString()})).setMimeType(ContentService.MimeType.JSON);
+    }
+  }
   return ContentService.createTextOutput('NATRAX Logger API');
 }
 
@@ -1713,6 +1880,9 @@ VehicleMake | VehicleModel | VehicleClass | TrackCategory | RFID | VehicleReg |
 TimeIn | TimeOut | ActualHrs | BilledHrs | OdoStart | OdoEnd |
 TrackCost | VehicleCost | TotalCost | Status
 
+A second tab called "Config" is auto-created by the script the
+first time billing settings are saved — no manual setup needed.
+
 ═══════════════════════════════════════════════════════
 HOSTING ON GITHUB PAGES
 ═══════════════════════════════════════════════════════
@@ -1721,8 +1891,9 @@ HOSTING ON GITHUB PAGES
 3. Go to Settings → Pages → Source: main branch / root
 4. Your app will be live at https://yourusername.github.io/repo-name/
 
-All data is stored in localStorage — no server needed!
-Google Sheets is used only for syncing completed sessions.
+The Google Sheet is the shared source of truth across all devices:
+logs and billing config are pulled from it on every load, and the
+app falls back to localStorage only while offline.
 -->
 </body>
 </html>
