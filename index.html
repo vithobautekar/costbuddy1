@@ -784,6 +784,7 @@ function seedState() {
     billing: {
       minHours: defaultMinHours(),
       rates: defaultRates(),
+      configUpdatedAt: 0,
     },
     logs: [],
     gsUrl: '',
@@ -1551,7 +1552,12 @@ function renderBilling() {
 
 function updateBilling(track, cat, val) { state.billing.minHours[track][cat]=Number(val); }
 function updateBillingRate(track, type, val) { state.billing.rates[track][type]=Number(val); }
-function saveBilling() { saveState(); pushConfigToSheet(); toast('Billing config saved ✓ (synced to team sheet)'); }
+async function saveBilling() {
+  saveState();
+  toast('Saving and syncing to team sheet…');
+  const ok = await pushConfigToSheet();
+  toast(ok ? 'Billing config saved ✓ (synced to team sheet)' : 'Saved locally — sheet sync failed, will retry next load', ok ? 'success' : 'error');
+}
 
 // ──────────────────────────────────────────────────────
 // VEHICLES PAGE
@@ -1755,20 +1761,27 @@ async function pullConfigFromSheet() {
     const res = await fetch(`${state.gsUrl}?action=getConfig`);
     const data = await res.json();
     if (!data || !data.ok || !data.config) return;
+    // Guard: never let a pull overwrite a local edit that hasn't been
+    // pushed to the sheet yet, or is newer than what's on the sheet.
+    if (state.billing.configUpdatedAt && data.updatedAt && data.updatedAt < state.billing.configUpdatedAt) return;
     const cfg = data.config;
     if (cfg.minHours) state.billing.minHours = cfg.minHours;
     if (cfg.rates) state.billing.rates = cfg.rates;
     if (cfg.vehicleClassRates) state.vehicleClassRates = cfg.vehicleClassRates;
+    if (data.updatedAt) state.billing.configUpdatedAt = data.updatedAt;
     saveState();
   } catch (e) { console.warn('Pull config error', e); }
 }
 
 async function pushConfigToSheet() {
-  if (!state.gsUrl) return;
+  if (!state.gsUrl) return false;
   try {
-    await fetch(state.gsUrl, {
+    // text/plain avoids a CORS preflight that Apps Script web apps don't
+    // handle, so unlike no-cors we get a real, readable response back —
+    // letting us confirm the save actually landed before any pull runs.
+    const res = await fetch(state.gsUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify({
         action: 'saveConfig',
         config: {
@@ -1777,9 +1790,15 @@ async function pushConfigToSheet() {
           vehicleClassRates: state.vehicleClassRates,
         },
       }),
-      mode: 'no-cors',
     });
-  } catch (e) { console.warn('Push config error', e); }
+    const data = await res.json();
+    if (data && data.ok) {
+      state.billing.configUpdatedAt = data.updatedAt || Date.now();
+      saveState();
+      return true;
+    }
+    return false;
+  } catch (e) { console.warn('Push config error', e); return false; }
 }
 
 async function syncFromSheetOnLoad() {
