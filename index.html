@@ -1570,7 +1570,7 @@ function renderVehicles() {
 }
 
 function updateVehicleClassRate(cls, val) { state.vehicleClassRates[cls]=Number(val)||0; }
-function saveVehicleRates() { saveState(); toast('Vehicle class rates saved ✓'); }
+function saveVehicleRates() { saveState(); pushConfigToSheet(); toast('Vehicle class rates saved ✓ (synced to team sheet)'); }
 
 // ──────────────────────────────────────────────────────
 // USERS PAGE
@@ -1610,19 +1610,19 @@ function addUser() {
   state.users.push({id:uid(),name,role,active:true,createdAt:Date.now(),...(role==='engineer'?{pin:cred}:{password:cred})});
   document.getElementById('u-name').value='';
   document.getElementById('u-cred').value='';
-  saveState(); renderUsers(); toast('User created');
+  saveState(); renderUsers(); toast('User created — syncing to team sheet…'); pushConfigToSheet();
 }
 
 function toggleUser(id) {
   state.users=state.users.map(u=>u.id===id?{...u,active:!u.active}:u);
-  saveState(); renderUsers();
+  saveState(); renderUsers(); pushConfigToSheet();
 }
 
 function resetCred(id, role) {
   const val=prompt(role==='engineer'?'New PIN (4–6 digits):':'New password:');
   if(!val)return;
   state.users=state.users.map(u=>u.id===id?{...u,...(u.role==='engineer'?{pin:val}:{password:val})}:u);
-  saveState(); renderUsers(); toast('Credential reset');
+  saveState(); renderUsers(); toast('Credential reset'); pushConfigToSheet();
 }
 
 // ──────────────────────────────────────────────────────
@@ -1768,6 +1768,16 @@ async function pullConfigFromSheet() {
     if (cfg.minHours) state.billing.minHours = cfg.minHours;
     if (cfg.rates) state.billing.rates = cfg.rates;
     if (cfg.vehicleClassRates) state.vehicleClassRates = cfg.vehicleClassRates;
+    if (cfg.users && Array.isArray(cfg.users) && cfg.users.length > 0) {
+      // Sheet is the master user list. Merge: sheet users win on conflict,
+      // but preserve any local-only users not yet pushed (e.g. just created
+      // before this pull resolved). Seed dummy IDs (u-eng1..3, u-mgr) are
+      // evicted once the sheet has a real user list.
+      const SEED_IDS = new Set(['u-eng1','u-eng2','u-eng3','u-mgr']);
+      const sheetById = new Map(cfg.users.map(u => [u.id, u]));
+      const localOnly = state.users.filter(u => !sheetById.has(u.id) && !SEED_IDS.has(u.id));
+      state.users = [...cfg.users, ...localOnly];
+    }
     if (data.updatedAt) state.billing.configUpdatedAt = data.updatedAt;
     saveState();
   } catch (e) { console.warn('Pull config error', e); }
@@ -1788,6 +1798,7 @@ async function pushConfigToSheet() {
           minHours: state.billing.minHours,
           rates: state.billing.rates,
           vehicleClassRates: state.vehicleClassRates,
+          users: state.users,
         },
       }),
     });
